@@ -1,0 +1,76 @@
+# Upstream golang.org/x/net has no GitHub Actions CI — it is built and tested by
+# Go's own build infrastructure. This workflow reproduces that build the way the
+# repo itself declares it: the toolchain from the `go` directive in go.mod, and
+# `go build ./...` / `go test ./...` over the whole module.
+#
+# The release artifact is the module source zip served by proxy.golang.org, built
+# here with Go's own golang.org/x/mod/zip.CreateFromDir so the member set matches
+# the proxy's by construction. The zip is packed from a copy of the tree with
+# .github/ removed, because the public module zip has no .github member at all.
+name: build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run. Empty runs the full suite."
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Show toolchain
+        run: go version
+
+      # Pack the module zip first, from the pristine tree, so no build byproduct
+      # can leak into it.
+      - name: Build module zip
+        run: |
+          set -eo pipefail
+          rsync -a --exclude '.git' --exclude '.github' ./ "${RUNNER_TEMP}/modsrc/"
+          mkdir -p "${RUNNER_TEMP}/zipper" build_output
+          cp .github/tools/create_mod.go "${RUNNER_TEMP}/zipper/"
+          cd "${RUNNER_TEMP}/zipper"
+          go mod init example.com/zipper
+          go get golang.org/x/mod
+          go run ./create_mod.go golang.org/x/net v0.45.0 \
+            "${RUNNER_TEMP}/modsrc" "${GITHUB_WORKSPACE}/build_output/v0.45.0.zip"
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee /tmp/scoped.log
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" /tmp/scoped.log || exit 1
+            done
+          else
+            go test ./...
+          fi
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: build_output/v0.45.0.zip
+          if-no-files-found: error
